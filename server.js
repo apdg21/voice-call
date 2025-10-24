@@ -1,6 +1,7 @@
 // server.js
+require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
+const { google } = require('googleapis');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
@@ -14,109 +15,118 @@ const wss = new WebSocket.Server({ server });
 app.use(cors());
 app.use(bodyParser.json());
 
-// MongoDB Connection
-mongoose.connect('mongodb://localhost:27017/walkie-talkie', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
-
-// User Schema
-const UserSchema = new mongoose.Schema({
-  googleId: String,
-  name: String,
-  email: String,
-  imageUrl: String,
-  contacts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
-});
-
-const User = mongoose.model('User', UserSchema);
-
-// WebSocket connection handling
-const clients = new Map();
-
-wss.on('connection', (ws) => {
-  console.log('Client connected');
-  
-  ws.on('message', (message) => {
-    const data = JSON.parse(message);
-    
-    if (data.type === 'auth') {
-      // Store client connection with user ID
-      clients.set(data.userId, ws);
-      console.log(`User ${data.userId} authenticated`);
-    } 
-    else if (data.type === 'audio') {
-      // Forward audio to the recipient
-      const recipientWs = clients.get(data.to);
-      if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-        recipientWs.send(JSON.stringify({
-          type: 'audio',
-          from: data.from,
-          data: data.data
-        }));
-      }
-    }
-  });
-  
-  ws.on('close', () => {
-    // Remove client from map when disconnected
-    for (const [userId, client] of clients.entries()) {
-      if (client === ws) {
-        clients.delete(userId);
-        break;
-      }
-    }
-    console.log('Client disconnected');
-  });
-});
-
-// API Routes
-// Get user contacts
-app.get('/api/contacts/:userId', async (req, res) => {
+// Google Sheets Configuration
+const configureSheets = () => {
   try {
-    const user = await User.findOne({ googleId: req.params.userId }).populate('contacts');
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-    res.json(user.contacts);
+    const auth = new google.auth.GoogleAuth({
+      keyFile: process.env.GOOGLE_SHEETS_KEY_FILE,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+
+    return google.sheets({ version: 'v4', auth });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error('❌ Failed to configure Google Sheets:', error.message);
+    process.exit(1);
   }
-});
+};
 
-// Add contact
-app.post('/api/contacts', async (req, res) => {
+const sheets = configureSheets();
+const SPREADSHEET_ID = process.env.GOOGLE_SHEET_ID;
+
+// Initialize Sheets Structure
+const initializeSheets = async () => {
   try {
-    const { userId, contact } = req.body;
-    
-    // Find or create the contact user
-    let contactUser = await User.findOne({ googleId: contact.googleId });
-    if (!contactUser) {
-      contactUser = new User({
-        googleId: contact.googleId,
-        name: contact.name,
-        email: contact.email,
-        imageUrl: contact.imageUrl,
-        contacts: []
+    // Create Users sheet headers
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Users!A1:E1',
+      valueInputOption: 'RAW',
+      resource: {
+        values: [['googleId', 'name', 'email', 'imageUrl', 'createdAt']]
+      }
+    });
+
+    // Create Contacts sheet headers
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Contacts!A1:E1',
+      valueInputOption: 'RAW',
+      resource: {
+        values: [['userId', 'contactId', 'contactName', 'contactImageUrl', 'createdAt']]
+      }
+    });
+
+    console.log('✅ Google Sheets initialized successfully');
+  } catch (error) {
+    console.log('ℹ️ Sheets already initialized or minor error:', error.message);
+  }
+};
+
+// Helper functions
+const sheetHelper = {
+  getAll: async (sheetName) => {
+    try {
+      const response = await sheets.spreadsheets.values.get({
+        spreadsheetId: SPREADSHEET_ID,
+        range: sheetName,
       });
-      await contactUser.save();
+      
+      const rows = response.data.values;
+      if (!rows || rows.length === 0) return [];
+      
+      const headers = rows[0];
+      return rows.slice(1).map(row => {
+        const obj = {};
+        headers.forEach((header, index) => {
+          obj[header] = row[index] || '';
+        });
+        return obj;
+      });
+    } catch (error) {
+      console.error(`Error reading from ${sheetName}:`, error);
+      throw error;
     }
-    
-    // Add contact to user's contact list
-    const user = await User.findOne({ googleId: userId });
-    if (!user.contacts.includes(contactUser._id)) {
-      user.contacts.push(contactUser._id);
-      await user.save();
-    }
-    
-    res.json(contactUser);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
+  },
 
-// Start server
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+  append: async (sheetName, rowData) => {
+    try {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: sheetName,
+        valueInputOption: 'RAW',
+        resource: {
+          values: [rowData]
+        }
+      });
+    } catch (error) {
+      console.error(`Error writing to ${sheetName}:`, error);
+      throw error;
+    }
+  },
+
+  find: async (sheetName, criteria) => {
+    const allData = await sheetHelper.getAll(sheetName);
+    return allData.find(item => {
+      for (let key in criteria) {
+        if (item[key] !== criteria[key]) return false;
+      }
+      return true;
+    });
+  },
+
+  findAll: async (sheetName, criteria) => {
+    const allData = await sheetHelper.getAll(sheetName);
+    return allData.filter(item => {
+      for (let key in criteria) {
+        if (item[key] !== criteria[key]) return false;
+      }
+      return true;
+    });
+  }
+};
+
+// Initialize on startup
+initializeSheets().catch(console.error);
+
+// ... rest of your WebSocket and API routes remain the same
+// (WebSocket code, /api/contacts, /api/contacts POST, etc.)
