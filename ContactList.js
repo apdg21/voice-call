@@ -1,31 +1,17 @@
-// ContactList.js
-import React, { useState, useEffect } from 'react';
-import { GoogleLogin } from 'react-google-login';
+// In ContactList.js, update the addContact function:
+const addContact = async (contact) => {
+  try {
+    // First, ensure current user exists
+    await fetch('/api/users', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(user)
+    });
 
-const ContactList = ({ user, setSelectedContact }) => {
-  const [contacts, setContacts] = useState([]);
-  const [searchTerm, setSearchTerm] = useState('');
-
-  useEffect(() => {
-    // Fetch contacts from backend
-    const fetchContacts = async () => {
-      try {
-        const response = await fetch(`/api/contacts/${user.googleId}`);
-        const data = await response.json();
-        setContacts(data);
-      } catch (error) {
-        console.error('Error fetching contacts:', error);
-      }
-    };
-
-    if (user) {
-      fetchContacts();
-    }
-  }, [user]);
-
-  const addContact = (contact) => {
-    // Add contact to backend
-    fetch('/api/contacts', {
+    // Then add the contact
+    const response = await fetch('/api/contacts', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -34,54 +20,13 @@ const ContactList = ({ user, setSelectedContact }) => {
         userId: user.googleId,
         contact: contact
       }),
-    })
-    .then(response => response.json())
-    .then(data => {
-      setContacts([...contacts, data]);
-    })
-    .catch(error => console.error('Error adding contact:', error));
-  };
-
-  const filteredContacts = contacts.filter(contact =>
-    contact.name.toLowerCase().includes(searchTerm.toLowerCase())
-  );
-
-  return (
-    <div className="contact-list">
-      <h2>Contacts</h2>
-      <div className="search">
-        <input
-          type="text"
-          placeholder="Search contacts..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-        />
-      </div>
-      
-      <div className="contact-items">
-        {filteredContacts.map(contact => (
-          <div 
-            key={contact.googleId} 
-            className="contact-item"
-            onClick={() => setSelectedContact(contact)}
-          >
-            <img src={contact.imageUrl} alt={contact.name} />
-            <span>{contact.name}</span>
-          </div>
-        ))}
-      </div>
-      
-      <div className="add-contact">
-        <h3>Add Contact</h3>
-        <GoogleLogin
-          clientId="YOUR_GOOGLE_CLIENT_ID"
-          buttonText="Add Google Contact"
-          onSuccess={(response) => addContact(response.profileObj)}
-          cookiePolicy={'single_host_origin'}
-        />
-      </div>
-    </div>
-  );
+    });
+    
+    if (!response.ok) throw new Error('Failed to add contact');
+    
+    const newContact = await response.json();
+    setContacts(prevContacts => [...prevContacts, newContact]);
+  } catch (error) {
+    console.error('Error adding contact:', error);
+  }
 };
-
-export default ContactList;
