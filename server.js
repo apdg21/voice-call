@@ -118,15 +118,22 @@ const sheetHelper = {
   }
 };
 
-// In-memory connected clients: googleId -> socket.id
+// In-memory connected clients: googleId -> { socketId, email }
 const clients = new Map();
+// Email lookup: email -> googleId (populated on /api/users)
+const emailToGoogleId = new Map();
 
 io.on('connection', (socket) => {
   console.log('🔌 Client connected:', socket.id);
 
-  socket.on('auth', async (userId) => {
-    console.log(`✅ User authenticated: ${userId}`);
-    clients.set(userId, socket.id);
+  socket.on('auth', async (data) => {
+    // Accept both old format (just userId string) and new format ({ userId, email })
+    const userId = typeof data === 'string' ? data : data.userId;
+    const email  = typeof data === 'string' ? null  : data.email;
+
+    console.log(`✅ User authenticated: ${userId} (${email || 'no email'})`);
+    clients.set(userId, { socketId: socket.id, email });
+    if (email) emailToGoogleId.set(email, userId);
     socket.userId = userId;
 
     // Deliver any queued (missed) messages
@@ -142,7 +149,6 @@ io.on('connection', (socket) => {
             timestamp: msg.timestamp,
             messageId: msg.id
           });
-          // Mark as delivered
           await sheetHelper.updateRow('Messages', { id: msg.id }, { delivered: 'true' });
         }
       }
@@ -154,39 +160,50 @@ io.on('connection', (socket) => {
   socket.on('audio', async (data) => {
     console.log(`🎤 Audio from ${data.from} to ${data.to}, size: ${data.data.length}`);
 
+    // Resolve recipient: might be a real googleId or a temp email-based ID
+    let resolvedTo = data.to;
+    if (!clients.has(resolvedTo)) {
+      // Try to find the real googleId by email (temp ID format: email-TIMESTAMP-email@domain)
+      const emailMatch = resolvedTo.match(/email-\d+-(.+)$/);
+      if (emailMatch) {
+        const realId = emailToGoogleId.get(emailMatch[1]);
+        if (realId) resolvedTo = realId;
+      }
+    }
+
     // Save to message history regardless of recipient online status
     const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const recipientOnline = clients.has(data.to);
+    const recipientOnline = clients.has(resolvedTo);
     const msgRow = [
-      messageId,
-      data.from,
-      data.fromName || '',
-      data.to,
-      JSON.stringify(data.data),
-      new Date().toISOString(),
-      recipientOnline ? 'true' : 'false'  // delivered flag
+      messageId, data.from, data.fromName || '', resolvedTo,
+      JSON.stringify(data.data), new Date().toISOString(),
+      recipientOnline ? 'true' : 'false'
     ];
     await sheetHelper.append('Messages', msgRow);
 
     // Forward immediately if recipient is online
-    const recipientSocketId = clients.get(data.to);
-    if (recipientSocketId) {
-      io.to(recipientSocketId).emit('audio', {
+    const recipientEntry = clients.get(resolvedTo);
+    if (recipientEntry) {
+      io.to(recipientEntry.socketId).emit('audio', {
         from: data.from,
         fromName: data.fromName || '',
         data: data.data,
         timestamp: new Date().toISOString(),
         messageId
       });
-      console.log(`✅ Audio forwarded to ${data.to}`);
+      console.log(`✅ Audio forwarded to ${resolvedTo}`);
     } else {
-      console.log(`📭 ${data.to} offline — message queued`);
+      console.log(`📭 ${resolvedTo} offline — message queued`);
     }
   });
 
   socket.on('disconnect', () => {
     console.log('🔌 Disconnected:', socket.id);
-    if (socket.userId) clients.delete(socket.userId);
+    if (socket.userId) {
+      const entry = clients.get(socket.userId);
+      if (entry?.email) emailToGoogleId.delete(entry.email);
+      clients.delete(socket.userId);
+    }
   });
 });
 
@@ -330,9 +347,13 @@ app.post('/api/init', async (req, res) => {
   }
 });
 
-// Who's online
+// Who's online — returns googleIds AND emails so frontend can match temp-ID contacts
 app.get('/api/online', (req, res) => {
-  res.json({ onlineUsers: Array.from(clients.keys()) });
+  const onlineUsers = Array.from(clients.keys());
+  const onlineEmails = Array.from(clients.values())
+    .map(e => e.email)
+    .filter(Boolean);
+  res.json({ onlineUsers, onlineEmails });
 });
 
 // Health check
