@@ -145,7 +145,7 @@ io.on('connection', (socket) => {
           socket.emit('audio', {
             from: msg.fromId,
             fromName: msg.fromName,
-            data: JSON.parse(msg.audioData),
+            data: msg.audioData,
             timestamp: msg.timestamp,
             messageId: msg.id
           });
@@ -176,7 +176,8 @@ io.on('connection', (socket) => {
     const recipientOnline = clients.has(resolvedTo);
     const msgRow = [
       messageId, data.from, data.fromName || '', resolvedTo,
-      JSON.stringify(data.data), new Date().toISOString(),
+      data.data,  // base64 string - store directly, no JSON.stringify needed
+      new Date().toISOString(),
       recipientOnline ? 'true' : 'false'
     ];
     await sheetHelper.append('Messages', msgRow);
@@ -281,6 +282,68 @@ app.post('/api/contacts', async (req, res) => {
   }
 });
 
+// Delete a contact
+app.delete('/api/contacts/:userId/:contactId', async (req, res) => {
+  try {
+    const { userId, contactId } = req.params;
+    if (!sheets || !SPREADSHEET_ID) throw new Error('Sheets not configured');
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'Contacts'
+    });
+    const rows = response.data.values;
+    if (!rows || rows.length < 2) return res.json({ success: true });
+
+    const headers = rows[0];
+    const userIdIdx = headers.indexOf('userId');
+    const contactIdIdx = headers.indexOf('contactId');
+
+    // Find the row index to delete
+    let rowToDelete = -1;
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][userIdIdx] === userId && rows[i][contactIdIdx] === contactId) {
+        rowToDelete = i + 1; // 1-indexed for Sheets API
+        break;
+      }
+    }
+
+    if (rowToDelete === -1) return res.json({ success: true }); // already gone
+
+    // Delete the row using batchUpdate
+    const sheetId = await getSheetId('Contacts');
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      resource: {
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: 'ROWS',
+              startIndex: rowToDelete - 1,
+              endIndex: rowToDelete
+            }
+          }
+        }]
+      }
+    });
+
+    console.log(`✅ Deleted contact ${contactId} for user ${userId}`);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Error deleting contact:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// Helper: get the numeric sheetId for a named sheet
+async function getSheetId(sheetName) {
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: SPREADSHEET_ID });
+  const sheet = meta.data.sheets.find(s => s.properties.title === sheetName);
+  if (!sheet) throw new Error(`Sheet "${sheetName}" not found`);
+  return sheet.properties.sheetId;
+}
+
 // Get contacts
 app.get('/api/contacts/:userId', async (req, res) => {
   try {
@@ -309,7 +372,7 @@ app.get('/api/messages/:userId/:contactId', async (req, res) => {
         from: m.fromId,
         fromName: m.fromName,
         to: m.toId,
-        data: JSON.parse(m.audioData),
+        data: m.audioData,
         timestamp: m.timestamp
       }));
     res.json(history);
