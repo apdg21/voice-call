@@ -362,12 +362,38 @@ async function getSheetId(sheetName) {
 app.get('/api/contacts/:userId', async (req, res) => {
   try {
     const rows = await sheetHelper.findAll('Contacts', { userId: req.params.userId });
-    res.json(rows.map(c => ({
-      googleId: c.contactId,
-      name: c.contactName,
-      email: c.email || '',
-      imageUrl: c.contactImageUrl
-    })));
+    // Load all users once so we can look up emails for contacts missing them
+    const allUsers = await sheetHelper.getAll('Users');
+    const userByGoogleId = {};
+    const userByEmail = {};
+    allUsers.forEach(u => {
+      if (u.googleId) userByGoogleId[u.googleId] = u;
+      if (u.email) userByEmail[u.email.toLowerCase()] = u;
+    });
+
+    res.json(rows.map(c => {
+      let email = c.email || '';
+      let googleId = c.contactId;
+      let name = c.contactName;
+      let imageUrl = c.contactImageUrl;
+
+      // If email is missing, try to look it up from Users by googleId
+      if (!email && userByGoogleId[googleId]) {
+        email = userByGoogleId[googleId].email || '';
+      }
+
+      // If contactId is a temp ID, try to resolve to real googleId via email
+      if (googleId.startsWith('email-') && email) {
+        const realUser = userByEmail[email.toLowerCase()];
+        if (realUser) {
+          googleId = realUser.googleId;
+          name = name || realUser.name;
+          imageUrl = imageUrl || realUser.imageUrl;
+        }
+      }
+
+      return { googleId, name, email, imageUrl };
+    }));
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
