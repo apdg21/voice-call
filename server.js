@@ -145,7 +145,7 @@ io.on('connection', (socket) => {
           socket.emit('audio', {
             from: msg.fromId,
             fromName: msg.fromName,
-            transcript: msg.transcript || null, data: null,
+            data: msg.audioData,
             timestamp: msg.timestamp,
             messageId: msg.id
           });
@@ -158,13 +158,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('audio', async (data) => {
-    console.log(`🎤 Audio received from ${data.from} to ${data.to}`);
-    console.log(`   fromName: ${data.fromName}, data length: ${data.data ? data.data.length : 'NULL'}`);
-
-    if (!data.data || data.data.length < 10) {
-      console.error('❌ Received empty or invalid audio data — not saving');
-      return;
-    }
+    console.log(`🎤 Audio from ${data.from} to ${data.to}, size: ${data.data.length}`);
 
     // Resolve recipient: might be a real googleId or a temp email-based ID
     let resolvedTo = data.to;
@@ -177,24 +171,16 @@ io.on('connection', (socket) => {
       }
     }
 
+    // Save to message history regardless of recipient online status
     const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const recipientOnline = clients.has(resolvedTo);
-
-    // Save transcript text to sheet (tiny — no size limit issues)
-    // Audio is forwarded in real-time only, never stored
-    const transcriptText = data.transcript || null;
-    if (transcriptText) {
-      const msgRow = [
-        messageId, data.from, data.fromName || '', resolvedTo,
-        transcriptText,
-        new Date().toISOString(),
-        recipientOnline ? 'true' : 'false'
-      ];
-      const saved = await sheetHelper.append('Messages', msgRow);
-      console.log(`   Transcript saved: "${transcriptText}" — ${saved ? '✅' : '❌'}`);
-    } else {
-      console.log(`   No transcript (iOS or unsupported browser) — audio forwarded in real-time only`);
-    }
+    const msgRow = [
+      messageId, data.from, data.fromName || '', resolvedTo,
+      data.data,  // base64 string - store directly, no JSON.stringify needed
+      new Date().toISOString(),
+      recipientOnline ? 'true' : 'false'
+    ];
+    await sheetHelper.append('Messages', msgRow);
 
     // Forward immediately if recipient is online
     const recipientEntry = clients.get(resolvedTo);
@@ -362,38 +348,12 @@ async function getSheetId(sheetName) {
 app.get('/api/contacts/:userId', async (req, res) => {
   try {
     const rows = await sheetHelper.findAll('Contacts', { userId: req.params.userId });
-    // Load all users once so we can look up emails for contacts missing them
-    const allUsers = await sheetHelper.getAll('Users');
-    const userByGoogleId = {};
-    const userByEmail = {};
-    allUsers.forEach(u => {
-      if (u.googleId) userByGoogleId[u.googleId] = u;
-      if (u.email) userByEmail[u.email.toLowerCase()] = u;
-    });
-
-    res.json(rows.map(c => {
-      let email = c.email || '';
-      let googleId = c.contactId;
-      let name = c.contactName;
-      let imageUrl = c.contactImageUrl;
-
-      // If email is missing, try to look it up from Users by googleId
-      if (!email && userByGoogleId[googleId]) {
-        email = userByGoogleId[googleId].email || '';
-      }
-
-      // If contactId is a temp ID, try to resolve to real googleId via email
-      if (googleId.startsWith('email-') && email) {
-        const realUser = userByEmail[email.toLowerCase()];
-        if (realUser) {
-          googleId = realUser.googleId;
-          name = name || realUser.name;
-          imageUrl = imageUrl || realUser.imageUrl;
-        }
-      }
-
-      return { googleId, name, email, imageUrl };
-    }));
+    res.json(rows.map(c => ({
+      googleId: c.contactId,
+      name: c.contactName,
+      email: c.email || '',
+      imageUrl: c.contactImageUrl
+    })));
   } catch (e) {
     res.status(500).json({ message: e.message });
   }
@@ -412,7 +372,7 @@ app.get('/api/messages/:userId/:contactId', async (req, res) => {
         from: m.fromId,
         fromName: m.fromName,
         to: m.toId,
-        transcript: m.transcript || null, data: null,
+        data: m.audioData,
         timestamp: m.timestamp
       }));
     res.json(history);
@@ -442,7 +402,7 @@ app.post('/api/init', async (req, res) => {
 
     await initSheet('Users',    ['googleId','name','email','imageUrl','createdAt']);
     await initSheet('Contacts', ['userId','contactId','contactName','email','contactImageUrl','createdAt']);
-    await initSheet('Messages', ['id','fromId','fromName','toId','transcript','timestamp','delivered']);
+    await initSheet('Messages', ['id','fromId','fromName','toId','audioData','timestamp','delivered']);
 
     res.json({ success: true, message: 'Sheets initialized' });
   } catch (e) {
