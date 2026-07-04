@@ -145,7 +145,7 @@ io.on('connection', (socket) => {
           socket.emit('audio', {
             from: msg.fromId,
             fromName: msg.fromName,
-            data: msg.audioData,
+            transcript: msg.transcript || null, data: null,
             timestamp: msg.timestamp,
             messageId: msg.id
           });
@@ -158,7 +158,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('audio', async (data) => {
-    console.log(`🎤 Audio from ${data.from} to ${data.to}, size: ${data.data.length}`);
+    console.log(`🎤 Audio received from ${data.from} to ${data.to}`);
+    console.log(`   fromName: ${data.fromName}, data length: ${data.data ? data.data.length : 'NULL'}`);
+
+    if (!data.data || data.data.length < 10) {
+      console.error('❌ Received empty or invalid audio data — not saving');
+      return;
+    }
 
     // Resolve recipient: might be a real googleId or a temp email-based ID
     let resolvedTo = data.to;
@@ -171,16 +177,24 @@ io.on('connection', (socket) => {
       }
     }
 
-    // Save to message history regardless of recipient online status
     const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const recipientOnline = clients.has(resolvedTo);
-    const msgRow = [
-      messageId, data.from, data.fromName || '', resolvedTo,
-      data.data,  // base64 string - store directly, no JSON.stringify needed
-      new Date().toISOString(),
-      recipientOnline ? 'true' : 'false'
-    ];
-    await sheetHelper.append('Messages', msgRow);
+
+    // Save transcript text to sheet (tiny — no size limit issues)
+    // Audio is forwarded in real-time only, never stored
+    const transcriptText = data.transcript || null;
+    if (transcriptText) {
+      const msgRow = [
+        messageId, data.from, data.fromName || '', resolvedTo,
+        transcriptText,
+        new Date().toISOString(),
+        recipientOnline ? 'true' : 'false'
+      ];
+      const saved = await sheetHelper.append('Messages', msgRow);
+      console.log(`   Transcript saved: "${transcriptText}" — ${saved ? '✅' : '❌'}`);
+    } else {
+      console.log(`   No transcript (iOS or unsupported browser) — audio forwarded in real-time only`);
+    }
 
     // Forward immediately if recipient is online
     const recipientEntry = clients.get(resolvedTo);
@@ -372,7 +386,7 @@ app.get('/api/messages/:userId/:contactId', async (req, res) => {
         from: m.fromId,
         fromName: m.fromName,
         to: m.toId,
-        data: m.audioData,
+        transcript: m.transcript || null, data: null,
         timestamp: m.timestamp
       }));
     res.json(history);
@@ -402,7 +416,7 @@ app.post('/api/init', async (req, res) => {
 
     await initSheet('Users',    ['googleId','name','email','imageUrl','createdAt']);
     await initSheet('Contacts', ['userId','contactId','contactName','email','contactImageUrl','createdAt']);
-    await initSheet('Messages', ['id','fromId','fromName','toId','audioData','timestamp','delivered']);
+    await initSheet('Messages', ['id','fromId','fromName','toId','transcript','timestamp','delivered']);
 
     res.json({ success: true, message: 'Sheets initialized' });
   } catch (e) {
