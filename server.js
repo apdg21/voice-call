@@ -138,18 +138,41 @@ io.on('connection', (socket) => {
 
     // Deliver any queued (missed) messages
     try {
+      // Deliver any queued (missed) messages - reassemble chunks first
       const pending = await sheetHelper.findAll('Messages', { toId: userId, delivered: 'false' });
       if (pending.length > 0) {
-        console.log(`📬 Delivering ${pending.length} queued messages to ${userId}`);
-        for (const msg of pending) {
+        // Group by message id and reassemble
+        const msgMap = {};
+        for (const row of pending) {
+          if (!msgMap[row.id]) {
+            msgMap[row.id] = {
+              id: row.id, fromId: row.fromId, fromName: row.fromName,
+              timestamp: row.timestamp,
+              totalChunks: parseInt(row.totalChunks) || 1,
+              chunks: {}
+            };
+          }
+          msgMap[row.id].chunks[parseInt(row.chunk) || 1] = row.audioData;
+        }
+
+        const assembled = Object.values(msgMap);
+        console.log(`📬 Delivering ${assembled.length} queued messages to ${userId}`);
+
+        for (const msg of assembled) {
+          const audioData = Array.from(
+            { length: msg.totalChunks },
+            (_, i) => msg.chunks[i + 1] || ''
+          ).join('');
+
           socket.emit('audio', {
             from: msg.fromId,
             fromName: msg.fromName,
-            transcript: msg.transcript || null, data: null,
+            data: audioData,
             timestamp: msg.timestamp,
             messageId: msg.id
           });
-          await sheetHelper.updateRow('Messages', { id: msg.id }, { delivered: 'true' });
+          // Mark all chunks of this message as delivered
+          await sheetHelper.updateRow('Messages', { id: msg.id, chunk: '1' }, { delivered: 'true' });
         }
       }
     } catch (e) {
@@ -159,7 +182,7 @@ io.on('connection', (socket) => {
 
   socket.on('audio', async (data) => {
     console.log(`🎤 Audio received from ${data.from} to ${data.to}`);
-    console.log(`   fromName: ${data.fromName}, data length: ${data.data ? data.data.length : 'NULL'}`);
+    console.log(`   fromName: ${data.fromName}, data length: ${data.data ? data.data.length : 'NULL'}, transcript: ${JSON.stringify(data.transcript)}, keys: ${Object.keys(data).join(',')}`);
 
     if (!data.data || data.data.length < 10) {
       console.error('❌ Received empty or invalid audio data — not saving');
@@ -180,21 +203,31 @@ io.on('connection', (socket) => {
     const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const recipientOnline = clients.has(resolvedTo);
 
-    // Save transcript text to sheet (tiny — no size limit issues)
-    // Audio is forwarded in real-time only, never stored
-    const transcriptText = data.transcript || null;
-    if (transcriptText) {
+    // Split audio into 40k char chunks to stay under Google Sheets 50k cell limit
+    const CHUNK_SIZE = 40000;
+    const audioData = data.data;
+    const totalChunks = Math.ceil(audioData.length / CHUNK_SIZE);
+
+    console.log(`   Saving ${totalChunks} chunk(s) for message ${messageId} (${audioData.length} chars total)`);
+
+    let allSaved = true;
+    for (let i = 0; i < totalChunks; i++) {
+      const chunk = audioData.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
       const msgRow = [
-        messageId, data.from, data.fromName || '', resolvedTo,
-        transcriptText,
+        messageId,
+        data.from,
+        data.fromName || '',
+        resolvedTo,
+        i + 1,          // chunk number (1-based)
+        totalChunks,    // total chunks for this message
+        chunk,
         new Date().toISOString(),
-        recipientOnline ? 'true' : 'false'
+        i === 0 ? (recipientOnline ? 'true' : 'false') : 'chunk' // only mark delivery on first chunk
       ];
       const saved = await sheetHelper.append('Messages', msgRow);
-      console.log(`   Transcript saved: "${transcriptText}" — ${saved ? '✅' : '❌'}`);
-    } else {
-      console.log(`   No transcript (iOS or unsupported browser) — audio forwarded in real-time only`);
+      if (!saved) { allSaved = false; break; }
     }
+    console.log(`   Save result: ${allSaved ? `✅ ${totalChunks} chunk(s) saved` : '❌ failed'}`);
 
     // Forward immediately if recipient is online
     const recipientEntry = clients.get(resolvedTo);
@@ -404,17 +437,49 @@ app.get('/api/messages/:userId/:contactId', async (req, res) => {
   try {
     const { userId, contactId } = req.params;
     const all = await sheetHelper.getAll('Messages');
-    const history = all
-      .filter(m => (m.fromId === userId && m.toId === contactId) || (m.fromId === contactId && m.toId === userId))
-      .slice(-50) // last 50 messages
-      .map(m => ({
-        id: m.id,
-        from: m.fromId,
-        fromName: m.fromName,
-        to: m.toId,
-        transcript: m.transcript || null, data: null,
-        timestamp: m.timestamp
-      }));
+    const rows = all.filter(m =>
+      (m.fromId === userId && m.toId === contactId) ||
+      (m.fromId === contactId && m.toId === userId)
+    );
+
+    // Group rows by message id and reassemble chunks
+    const messageMap = {};
+    for (const row of rows) {
+      const id = row.id;
+      if (!messageMap[id]) {
+        messageMap[id] = {
+          id,
+          from: row.fromId,
+          fromName: row.fromName,
+          to: row.toId,
+          timestamp: row.timestamp,
+          totalChunks: parseInt(row.totalChunks) || 1,
+          chunks: {}
+        };
+      }
+      const chunkNum = parseInt(row.chunk) || 1;
+      messageMap[id].chunks[chunkNum] = row.audioData;
+    }
+
+    // Reassemble and return last 50 messages
+    const history = Object.values(messageMap)
+      .map(msg => {
+        const assembled = Array.from(
+          { length: msg.totalChunks },
+          (_, i) => msg.chunks[i + 1] || ''
+        ).join('');
+        return {
+          id: msg.id,
+          from: msg.from,
+          fromName: msg.fromName,
+          to: msg.to,
+          data: assembled || null,
+          timestamp: msg.timestamp
+        };
+      })
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+      .slice(-50);
+
     res.json(history);
   } catch (e) {
     res.status(500).json({ message: e.message });
@@ -442,7 +507,7 @@ app.post('/api/init', async (req, res) => {
 
     await initSheet('Users',    ['googleId','name','email','imageUrl','createdAt']);
     await initSheet('Contacts', ['userId','contactId','contactName','email','contactImageUrl','createdAt']);
-    await initSheet('Messages', ['id','fromId','fromName','toId','transcript','timestamp','delivered']);
+    await initSheet('Messages', ['id','fromId','fromName','toId','chunk','totalChunks','audioData','timestamp','delivered']);
 
     res.json({ success: true, message: 'Sheets initialized' });
   } catch (e) {
